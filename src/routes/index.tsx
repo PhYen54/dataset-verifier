@@ -66,7 +66,7 @@ interface ItemState {
 }
 
 const INITIAL_BATCH = 100;
-const BG_BATCH = 200;
+const BATCH = 100;
 
 function OcrVerifier() {
   const [datasetId, setDatasetId] = useState("");
@@ -79,7 +79,7 @@ function OcrVerifier() {
   const [current, setCurrent] = useState(0);
 
   const [loading, setLoading] = useState(false);
-  const [bgLoading, setBgLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [loadedCount, setLoadedCount] = useState(0);
 
   const [pushing, setPushing] = useState(false);
@@ -108,31 +108,39 @@ function OcrVerifier() {
       }
       return next;
     });
-    setLoadedCount((c) => c + rows.length);
+    setLoadedCount((c) => {
+      const next = c + rows.length;
+      console.debug(`[ingest] added ${rows.length} rows, loadedCount -> ${next}`);
+      return next;
+    });
   }, []);
 
-  const loadInBackground = useCallback(
-    async (dsInfo: DatasetInfo, startOffset: number) => {
-      setBgLoading(true);
+  const loadNextBatch = useCallback(
+    async (dsInfo: DatasetInfo, startOffset: number, datasetParam?: string) => {
+      setLoadingMore(true);
       try {
-        for (let offset = startOffset; offset < dsInfo.numRows; offset += BG_BATCH) {
-          if (cancelBgRef.current) break;
-          const length = Math.min(BG_BATCH, dsInfo.numRows - offset);
-          try {
-            const rows = await fetchRows(datasetId, dsInfo, offset, length, readToken || undefined);
-            ingest(rows);
-          } catch (err) {
-            console.error("Background batch failed", err);
-            // brief backoff
-            await new Promise((r) => setTimeout(r, 1500));
-          }
-        }
+        const ds = datasetParam ?? datasetId;
+        const length = Math.min(BATCH, dsInfo.numRows - startOffset);
+        if (length <= 0) return;
+        console.debug(`[lazy] fetching offset=${startOffset} length=${length} dataset=${ds}`);
+        const rows = await fetchRows(ds, dsInfo, startOffset, length, readToken || undefined);
+        console.debug(`[lazy] fetched ${rows.length} rows for offset=${startOffset}`);
+        ingest(rows);
+      } catch (err) {
+        console.error("Lazy batch load failed", err);
+        toast.error("Failed to load next batch of rows");
       } finally {
-        setBgLoading(false);
+        console.info(`[lazy] batch loading stopped (cancel=${cancelBgRef.current})`);
+        setLoadingMore(false);
       }
     },
     [datasetId, readToken, ingest],
   );
+
+    useEffect(() => {
+      if (!total) return;
+      console.info(`[progress] ${loadedCount} / ${total} (${total ? ((loadedCount / total) * 100).toFixed(1) : 0}%)`);
+    }, [loadedCount, total]);
 
   const handleLoad = useCallback(async () => {
     if (!datasetId.trim()) {
@@ -153,17 +161,14 @@ function OcrVerifier() {
       const firstLen = Math.min(INITIAL_BATCH, dsInfo.numRows);
       const firstRows = await fetchRows(datasetId.trim(), dsInfo, 0, firstLen, readToken || undefined);
       ingest(firstRows);
+      console.info(`[load] initial batch loaded ${firstRows.length} / ${dsInfo.numRows}`);
       toast.success(`Loaded first ${firstRows.length} of ${dsInfo.numRows} rows`);
       setLoading(false);
-      // background fetch the rest
-      if (dsInfo.numRows > firstLen) {
-        void loadInBackground(dsInfo, firstLen);
-      }
     } catch (err) {
       setLoading(false);
       toast.error(err instanceof Error ? err.message : "Failed to load dataset");
     }
-  }, [datasetId, readToken, ingest, loadInBackground]);
+  }, [datasetId, readToken, ingest]);
 
   // ---------- Mutations ----------
   const update = useCallback((idx: number, patch: Partial<ItemState>) => {
@@ -230,8 +235,8 @@ function OcrVerifier() {
     setPushing(true);
     setPushProgress({ done: 0, total: kept.length });
 
-    // Pause background loading to free up connections during push
-    const wasBgLoading = bgLoading;
+    // Pause any batch loading to free up connections during push
+    const wasBgLoading = loadingMore;
     cancelBgRef.current = true;
 
     try {
@@ -270,13 +275,13 @@ function OcrVerifier() {
       toast.error(err instanceof Error ? err.message : "Push failed");
     } finally {
       setPushing(false);
-      // Resume background loading if it was running and dataset isn't fully loaded
+      // Resume batch loading if it was running and dataset isn't fully loaded
       if (wasBgLoading && info && loadedCount < info.numRows) {
         cancelBgRef.current = false;
-        void loadInBackground(info, loadedCount);
+        void loadNextBatch(info, loadedCount, datasetId.trim());
       }
     }
-  }, [items, writeToken, targetRepo, readToken, bgLoading, info, loadedCount, loadInBackground]);
+  }, [items, writeToken, targetRepo, readToken, loadingMore, info, loadedCount, loadNextBatch, datasetId]);
 
   // ---------- Derived ----------
   const stats = useMemo(() => {
@@ -356,12 +361,12 @@ function OcrVerifier() {
                     <Badge variant="outline" className="tabular-nums">
                       {loadedCount.toLocaleString()} / {total.toLocaleString()}
                     </Badge>
-                    {bgLoading && (
+                    {loadingMore && (
                       <Badge className="bg-primary/15 text-primary border-primary/20">
-                        <Loader2 className="size-3 animate-spin mr-1" /> background
+                        <Loader2 className="size-3 animate-spin mr-1" /> loading more
                       </Badge>
                     )}
-                    {!bgLoading && total > 0 && loadedCount >= total && (
+                    {!loadingMore && total > 0 && loadedCount >= total && (
                       <Badge className="bg-success text-success-foreground">
                         <CheckCircle2 className="size-3 mr-1" /> complete
                       </Badge>
@@ -374,9 +379,26 @@ function OcrVerifier() {
                         className="h-1.5"
                       />
                       <div className="flex justify-between text-[10px] text-muted-foreground tabular-nums">
-                        <span>background load</span>
-                        <span>{((loadedCount / total) * 100).toFixed(1)}%</span>
+                        <span>lazy loaded</span>
+                        <span>{loadedCount.toLocaleString()} / {total.toLocaleString()}</span>
                       </div>
+                    </div>
+                  )}
+                  {total > 0 && loadedCount < total && (
+                    <div className="pt-2">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => loadNextBatch(info, loadedCount, datasetId.trim())}
+                        disabled={loadingMore}
+                        className="w-full"
+                      >
+                        {loadingMore ? (
+                          <><Loader2 className="size-4 animate-spin mr-2" /> Loading more</>
+                        ) : (
+                          <>Load next {Math.min(BATCH, total - loadedCount)} rows</>
+                        )}
+                      </Button>
                     </div>
                   )}
                 </div>
@@ -589,8 +611,8 @@ function EmptyState() {
       <h2 className="text-xl font-semibold">Load a Hugging Face dataset to begin</h2>
       <p className="text-sm text-muted-foreground mt-2 max-w-md">
         Enter a dataset ID with <code className="font-mono">image</code> and a string
-        label column. The first 100 rows load instantly, the rest stream in the
-        background.
+        label column. The first 100 rows load instantly, then additional rows
+        load in batches of 100 on demand.
       </p>
     </div>
   );
