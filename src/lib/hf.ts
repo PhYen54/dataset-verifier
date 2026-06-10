@@ -94,8 +94,17 @@ export async function fetchRows(
 }
 
 export async function fetchImageBlob(url: string, token?: string): Promise<Blob> {
+  // Pre-signed HF CDN URLs (cached-assets) already carry auth in the query string.
+  // Adding an Authorization header triggers a CORS preflight the CDN rejects,
+  // causing a "Failed to fetch". Only attach the bearer for raw huggingface.co API URLs.
+  const isPresigned =
+    /[?&](Signature|X-Amz-Signature|sig)=/.test(url) ||
+    url.includes("cached-assets") ||
+    url.includes("cdn-lfs");
   const headers: Record<string, string> = {};
-  if (token && url.includes("huggingface.co")) headers.Authorization = `Bearer ${token}`;
+  if (token && url.includes("huggingface.co") && !isPresigned) {
+    headers.Authorization = `Bearer ${token}`;
+  }
   const res = await fetch(url, { headers });
   if (!res.ok) throw new Error(`Image fetch failed: ${res.status}`);
   return await res.blob();
