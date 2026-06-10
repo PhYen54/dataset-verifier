@@ -348,17 +348,36 @@ function OcrVerifier() {
                 )}
               </Button>
             </div>
-            <div className="md:col-span-3 flex items-end gap-2">
+            <div className="md:col-span-3 flex items-end">
               {info && (
-                <div className="flex flex-wrap gap-1.5">
-                  <Badge variant="secondary">{info.split}</Badge>
-                  <Badge variant="outline">
-                    {loadedCount.toLocaleString()} / {total.toLocaleString()} loaded
-                  </Badge>
-                  {bgLoading && (
-                    <Badge className="bg-primary/15 text-primary border-primary/20">
-                      <Loader2 className="size-3 animate-spin mr-1" /> background
+                <div className="w-full space-y-1.5">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <Badge variant="secondary">{info.split}</Badge>
+                    <Badge variant="outline" className="tabular-nums">
+                      {loadedCount.toLocaleString()} / {total.toLocaleString()}
                     </Badge>
+                    {bgLoading && (
+                      <Badge className="bg-primary/15 text-primary border-primary/20">
+                        <Loader2 className="size-3 animate-spin mr-1" /> background
+                      </Badge>
+                    )}
+                    {!bgLoading && total > 0 && loadedCount >= total && (
+                      <Badge className="bg-success text-success-foreground">
+                        <CheckCircle2 className="size-3 mr-1" /> complete
+                      </Badge>
+                    )}
+                  </div>
+                  {total > 0 && (
+                    <div className="space-y-0.5">
+                      <Progress
+                        value={(loadedCount / total) * 100}
+                        className="h-1.5"
+                      />
+                      <div className="flex justify-between text-[10px] text-muted-foreground tabular-nums">
+                        <span>background load</span>
+                        <span>{((loadedCount / total) * 100).toFixed(1)}%</span>
+                      </div>
+                    </div>
                   )}
                 </div>
               )}
