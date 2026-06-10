@@ -230,12 +230,23 @@ function OcrVerifier() {
     setPushing(true);
     setPushProgress({ done: 0, total: kept.length });
 
+    // Pause background loading to free up connections during push
+    const wasBgLoading = bgLoading;
+    cancelBgRef.current = true;
+
     try {
       const transformed: { filename: string; blob: Blob; label: string }[] = [];
       // Transform images sequentially to keep memory bounded (one bitmap at a time).
       for (let i = 0; i < kept.length; i++) {
         const it = kept[i];
-        const orig = await fetchImageBlob(it.imageUrl, readToken || undefined);
+        let orig: Blob;
+        try {
+          orig = await fetchImageBlob(it.imageUrl, readToken || undefined);
+        } catch (e) {
+          // Retry once without auth header in case of CORS issues on signed URLs
+          console.warn(`Image fetch failed for row ${it.index}, retrying without auth`, e);
+          orig = await fetchImageBlob(it.imageUrl);
+        }
         const needTx = it.rotation !== 0 || it.flipH || it.flipV;
         const blob = needTx
           ? await transformImage(orig, it.rotation, it.flipH, it.flipV, orig.type || "image/png")
@@ -255,11 +266,17 @@ function OcrVerifier() {
       });
       toast.success(`Pushed ${kept.length} samples to ${targetRepo}`);
     } catch (err) {
+      console.error("Push failed", err);
       toast.error(err instanceof Error ? err.message : "Push failed");
     } finally {
       setPushing(false);
+      // Resume background loading if it was running and dataset isn't fully loaded
+      if (wasBgLoading && info && loadedCount < info.numRows) {
+        cancelBgRef.current = false;
+        void loadInBackground(info, loadedCount);
+      }
     }
-  }, [items, writeToken, targetRepo, readToken]);
+  }, [items, writeToken, targetRepo, readToken, bgLoading, info, loadedCount, loadInBackground]);
 
   // ---------- Derived ----------
   const stats = useMemo(() => {
