@@ -16,6 +16,7 @@ import {
   ImageIcon,
 } from "lucide-react";
 import { toast } from "sonner";
+import { zipSync, strToU8 } from "fflate";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -80,6 +81,8 @@ function OcrVerifier() {
 
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState({ done: 0, total: 0 });
   const [loadedCount, setLoadedCount] = useState(0);
 
   const [pushing, setPushing] = useState(false);
@@ -136,6 +139,78 @@ function OcrVerifier() {
     },
     [datasetId, readToken, ingest],
   );
+
+  const handleDownload = useCallback(async () => {
+    if (!info) {
+      toast.error("Load a dataset first");
+      return;
+    }
+
+    const kept = items.filter((item) => !item.deleted);
+    if (!kept.length) {
+      toast.error("No edited rows available to download");
+      return;
+    }
+
+    setDownloading(true);
+    setDownloadProgress({ done: 0, total: kept.length + 2 });
+    try {
+      const transformed: { filename: string; blob: Blob; label: string }[] = [];
+      for (let i = 0; i < kept.length; i++) {
+        const it = kept[i];
+        let orig: Blob;
+        try {
+          orig = await fetchImageBlob(it.imageUrl, readToken || undefined);
+        } catch (e) {
+          console.warn(`Image fetch failed for row ${it.index}, retrying without auth`, e);
+          orig = await fetchImageBlob(it.imageUrl);
+        }
+        const needTx = it.rotation !== 0 || it.flipH || it.flipV;
+        const blob = needTx
+          ? await transformImage(orig, it.rotation, it.flipH, it.flipV, orig.type || "image/png")
+          : orig;
+        const ext = inferExtension(blob.type || orig.type || "image/png");
+        transformed.push({
+          filename: `${String(it.index).padStart(7, "0")}.${ext}`,
+          blob,
+          label: it.label,
+        });
+        setDownloadProgress({ done: i + 1, total: kept.length + 2 });
+      }
+
+      const metadataLines = transformed.map((it) =>
+        JSON.stringify({ file_name: `images/${it.filename}`, text: it.label }),
+      );
+      const readme = `---\nlicense: mit\ntask_categories:\n- image-to-text\n---\n\n# ${datasetId || "edited-dataset"}\n\nCleaned OCR dataset generated with OCR Dataset Verification Tool.\n\n- ${transformed.length} samples\n- columns: \`image\`, \`text\`\n`;
+      const entries: Record<string, Uint8Array> = {
+        "README.md": strToU8(readme),
+        "metadata.jsonl": strToU8(metadataLines.join("\n")),
+      };
+
+      for (const it of transformed) {
+        const buffer = new Uint8Array(await new Response(it.blob).arrayBuffer());
+        entries[`images/${it.filename}`] = buffer;
+      }
+
+      const zipData = zipSync(entries);
+      const zipBlob = new Blob([zipData], { type: "application/zip" });
+      const url = URL.createObjectURL(zipBlob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `${datasetId.replace(/\//g, "_") || "edited-dataset"}.zip`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+      setDownloadProgress((prev) => ({ done: prev.total, total: prev.total }));
+      toast.success("Dataset download ready");
+    } catch (err) {
+      console.error("Download failed", err);
+      toast.error(err instanceof Error ? err.message : "Download failed");
+    } finally {
+      setDownloading(false);
+    }
+  }, [datasetId, info, items, readToken]);
 
     useEffect(() => {
       if (!total) return;
@@ -572,7 +647,7 @@ function OcrVerifier() {
                 />
               </div>
               <div className="md:col-span-2 flex items-end">
-                <Button onClick={handlePush} disabled={pushing} className="w-full">
+                <Button onClick={handlePush} disabled={pushing || downloading} className="w-full">
                   {pushing ? (
                     <><Loader2 className="size-4 animate-spin" /> Pushing</>
                   ) : (
@@ -580,7 +655,35 @@ function OcrVerifier() {
                   )}
                 </Button>
               </div>
+              <div className="md:col-span-12 flex items-end justify-end">
+                <Button
+                  variant="outline"
+                  onClick={handleDownload}
+                  disabled={downloading || pushing || !items.length}
+                  className="w-full md:w-auto"
+                >
+                  {downloading ? (
+                    <><Loader2 className="size-4 animate-spin mr-2" /> Downloading</>
+                  ) : (
+                    <>Download edited dataset</>
+                  )}
+                </Button>
+              </div>
             </div>
+
+            {(downloading || downloadProgress.total > 0) && (
+              <div className="mt-4 space-y-1.5">
+                <Progress
+                  value={downloadProgress.total ? (downloadProgress.done / downloadProgress.total) * 100 : 0}
+                />
+                <div className="flex justify-between text-xs text-muted-foreground tabular-nums">
+                  <span>{downloading ? "Preparing download…" : "Download complete"}</span>
+                  <span>
+                    {downloadProgress.done} / {downloadProgress.total}
+                  </span>
+                </div>
+              </div>
+            )}
 
             {pushing && (
               <div className="mt-4 space-y-1.5">
