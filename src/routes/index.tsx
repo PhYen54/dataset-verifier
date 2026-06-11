@@ -74,6 +74,8 @@ function OcrVerifier() {
   const [readToken, setReadToken] = useState("");
   const [writeToken, setWriteToken] = useState("");
   const [targetRepo, setTargetRepo] = useState("");
+  const [startIndex, setStartIndex] = useState("");
+  const [baseOffset, setBaseOffset] = useState(0);
 
   const [info, setInfo] = useState<DatasetInfo | null>(null);
   const [items, setItems] = useState<ItemState[]>([]);
@@ -91,6 +93,7 @@ function OcrVerifier() {
   const cancelBgRef = useRef(false);
 
   const total = info?.numRows ?? 0;
+  const visibleTotal = info ? Math.max(0, info.numRows - baseOffset) : 0;
   const item = items[current];
 
   // ---------- Loaders ----------
@@ -119,15 +122,16 @@ function OcrVerifier() {
   }, []);
 
   const loadNextBatch = useCallback(
-    async (dsInfo: DatasetInfo, startOffset: number, datasetParam?: string) => {
+    async (dsInfo: DatasetInfo, relativeLoaded: number, datasetParam?: string) => {
       setLoadingMore(true);
       try {
         const ds = datasetParam ?? datasetId;
-        const length = Math.min(BATCH, dsInfo.numRows - startOffset);
+        const start = baseOffset + relativeLoaded;
+        const length = Math.min(BATCH, dsInfo.numRows - start);
         if (length <= 0) return;
-        console.debug(`[lazy] fetching offset=${startOffset} length=${length} dataset=${ds}`);
-        const rows = await fetchRows(ds, dsInfo, startOffset, length, readToken || undefined);
-        console.debug(`[lazy] fetched ${rows.length} rows for offset=${startOffset}`);
+        console.debug(`[lazy] fetching offset=${start} length=${length} dataset=${ds}`);
+        const rows = await fetchRows(ds, dsInfo, start, length, readToken || undefined);
+        console.debug(`[lazy] fetched ${rows.length} rows for offset=${start}`);
         ingest(rows);
       } catch (err) {
         console.error("Lazy batch load failed", err);
@@ -137,7 +141,7 @@ function OcrVerifier() {
         setLoadingMore(false);
       }
     },
-    [datasetId, readToken, ingest],
+    [datasetId, readToken, ingest, baseOffset],
   );
 
   const handleDownload = useCallback(async () => {
@@ -213,9 +217,9 @@ function OcrVerifier() {
   }, [datasetId, info, items, readToken]);
 
     useEffect(() => {
-      if (!total) return;
-      console.info(`[progress] ${loadedCount} / ${total} (${total ? ((loadedCount / total) * 100).toFixed(1) : 0}%)`);
-    }, [loadedCount, total]);
+      if (!visibleTotal) return;
+      console.info(`[progress] ${loadedCount} / ${visibleTotal} (${visibleTotal ? ((loadedCount / visibleTotal) * 100).toFixed(1) : 0}%)`);
+    }, [loadedCount, visibleTotal]);
 
   const handleLoad = useCallback(async () => {
     if (!datasetId.trim()) {
@@ -233,17 +237,22 @@ function OcrVerifier() {
     try {
       const dsInfo = await fetchDatasetInfo(datasetId.trim(), readToken || undefined);
       setInfo(dsInfo);
-      const firstLen = Math.min(INITIAL_BATCH, dsInfo.numRows);
-      const firstRows = await fetchRows(datasetId.trim(), dsInfo, 0, firstLen, readToken || undefined);
+      const rawStart = Number(startIndex) || 0;
+      const start = Math.max(0, Math.min(rawStart, Math.max(0, dsInfo.numRows - 1)));
+      setBaseOffset(start);
+      const firstLen = Math.min(INITIAL_BATCH, Math.max(0, dsInfo.numRows - start));
+      const firstRows = await fetchRows(datasetId.trim(), dsInfo, start, firstLen, readToken || undefined);
       ingest(firstRows);
-      console.info(`[load] initial batch loaded ${firstRows.length} / ${dsInfo.numRows}`);
-      toast.success(`Loaded first ${firstRows.length} of ${dsInfo.numRows} rows`);
+      console.info(`[load] initial batch loaded ${firstRows.length} / ${dsInfo.numRows} (start=${start})`);
+      toast.success(`Loaded ${firstRows.length} rows starting at ${start} of ${dsInfo.numRows} total rows`);
       setLoading(false);
     } catch (err) {
       setLoading(false);
       toast.error(err instanceof Error ? err.message : "Failed to load dataset");
     }
-  }, [datasetId, readToken, ingest]);
+  }, [datasetId, readToken, startIndex, ingest]);
+
+
 
   // ---------- Mutations ----------
   const update = useCallback((idx: number, patch: Partial<ItemState>) => {
@@ -351,7 +360,7 @@ function OcrVerifier() {
     } finally {
       setPushing(false);
       // Resume batch loading if it was running and dataset isn't fully loaded
-      if (wasBgLoading && info && loadedCount < info.numRows) {
+      if (wasBgLoading && info && loadedCount < visibleTotal) {
         cancelBgRef.current = false;
         void loadNextBatch(info, loadedCount, datasetId.trim());
       }
@@ -419,6 +428,15 @@ function OcrVerifier() {
                 onChange={(e) => setReadToken(e.target.value)}
               />
             </div>
+            <div className="md:col-span-2">
+              <Label htmlFor="startIdx" className="text-xs">Start index (optional)</Label>
+              <Input
+                id="startIdx"
+                placeholder="start"
+                value={startIndex}
+                onChange={(e) => setStartIndex(e.target.value)}
+              />
+            </div>
             <div className="md:col-span-2 flex items-end">
               <Button onClick={handleLoad} disabled={loading} className="w-full">
                 {loading ? (
@@ -434,14 +452,14 @@ function OcrVerifier() {
                   <div className="flex flex-wrap items-center gap-1.5">
                     <Badge variant="secondary">{info.split}</Badge>
                     <Badge variant="outline" className="tabular-nums">
-                      {loadedCount.toLocaleString()} / {total.toLocaleString()}
+                      {loadedCount.toLocaleString()} / {visibleTotal.toLocaleString()}
                     </Badge>
                     {loadingMore && (
                       <Badge className="bg-primary/15 text-primary border-primary/20">
                         <Loader2 className="size-3 animate-spin mr-1" /> loading more
                       </Badge>
                     )}
-                    {!loadingMore && total > 0 && loadedCount >= total && (
+                    {!loadingMore && visibleTotal > 0 && loadedCount >= visibleTotal && (
                       <Badge className="bg-success text-success-foreground">
                         <CheckCircle2 className="size-3 mr-1" /> complete
                       </Badge>
@@ -450,16 +468,16 @@ function OcrVerifier() {
                   {total > 0 && (
                     <div className="space-y-0.5">
                       <Progress
-                        value={(loadedCount / total) * 100}
+                        value={visibleTotal ? (loadedCount / visibleTotal) * 100 : 0}
                         className="h-1.5"
                       />
                       <div className="flex justify-between text-[10px] text-muted-foreground tabular-nums">
                         <span>lazy loaded</span>
-                        <span>{loadedCount.toLocaleString()} / {total.toLocaleString()}</span>
+                        <span>{loadedCount.toLocaleString()} / {visibleTotal.toLocaleString()}</span>
                       </div>
                     </div>
                   )}
-                  {total > 0 && loadedCount < total && (
+                  {visibleTotal > 0 && loadedCount < visibleTotal && (
                     <div className="pt-2">
                       <Button
                         size="sm"
@@ -471,7 +489,7 @@ function OcrVerifier() {
                         {loadingMore ? (
                           <><Loader2 className="size-4 animate-spin mr-2" /> Loading more</>
                         ) : (
-                          <>Load next {Math.min(BATCH, total - loadedCount)} rows</>
+                          <>Load next {Math.min(BATCH, visibleTotal - loadedCount)} rows</>
                         )}
                       </Button>
                     </div>
@@ -712,10 +730,11 @@ function EmptyState() {
         <Database className="size-8 text-primary" />
       </div>
       <h2 className="text-xl font-semibold">Load a Hugging Face dataset to begin</h2>
-      <p className="text-sm text-muted-foreground mt-2 max-w-md">
+        <p className="text-sm text-muted-foreground mt-2 max-w-md">
         Enter a dataset ID with <code className="font-mono">image</code> and a string
         label column. The first 100 rows load instantly, then additional rows
-        load in batches of 100 on demand.
+        load in batches of 100 on demand. You can also specify a start and end
+        index to load a specific range of rows.
       </p>
     </div>
   );
