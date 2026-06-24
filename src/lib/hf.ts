@@ -2,6 +2,14 @@ import { uploadFiles, createRepo, type RepoDesignation } from "@huggingface/hub"
 
 const DS_SERVER = "https://datasets-server.huggingface.co";
 
+function buildHfHeaders(token?: string): Record<string, string> | undefined {
+  if (!token) return undefined;
+  return {
+    Authorization: `Bearer ${token}`,
+    "X-HF-Token": token,
+  };
+}
+
 export interface HfRow {
   index: number;
   imageUrl: string; // remote URL or blob URL
@@ -31,8 +39,7 @@ export async function fetchDatasetInfo(
   dataset: string,
   token?: string,
 ): Promise<DatasetInfo> {
-  const headers: Record<string, string> = {};
-  if (token) headers.Authorization = `Bearer ${token}`;
+  const headers = buildHfHeaders(token);
 
   const splitsRes = await fetch(`${DS_SERVER}/splits?dataset=${encodeURIComponent(dataset)}`, { headers });
   if (!splitsRes.ok) throw new Error(`Failed to fetch splits: ${splitsRes.status} ${await splitsRes.text()}`);
@@ -43,11 +50,24 @@ export async function fetchDatasetInfo(
 
   // Probe first row to discover schema
   const probe = await fetchRowsRaw(dataset, preferred.config, preferred.split, 0, 1, token);
-  const imgFeat = probe.features.find((f) => f.type._type === "Image");
-  const strFeat = probe.features.find(
-    (f) => f.type._type === "Value" && f.type.dtype === "string",
-  );
-  if (!imgFeat) throw new Error("Dataset has no Image column");
+  const imgFeat =
+    probe.features.find((f) => ["image", "img"].includes(f.name)) ??
+    probe.features.find((f) => f.type._type === "Image") ??
+    probe.features.find(
+      (f) =>
+        f.type._type === "Value" &&
+        f.type.dtype === "string" &&
+        !["label", "text", "file_name"].includes(f.name),
+    );
+  const strFeat =
+    probe.features.find((f) => ["label", "text"].includes(f.name)) ??
+    probe.features.find(
+      (f) =>
+        f.type._type === "Value" &&
+        f.type.dtype === "string" &&
+        !["image", "img", "file_name"].includes(f.name),
+    );
+  if (!imgFeat) throw new Error("Dataset has no image column");
   if (!strFeat) throw new Error("Dataset has no string label column");
 
   return {
@@ -67,8 +87,7 @@ async function fetchRowsRaw(
   length: number,
   token?: string,
 ): Promise<RowsResponse> {
-  const headers: Record<string, string> = {};
-  if (token) headers.Authorization = `Bearer ${token}`;
+  const headers = buildHfHeaders(token);
   const url = `${DS_SERVER}/rows?dataset=${encodeURIComponent(dataset)}&config=${encodeURIComponent(
     config,
   )}&split=${encodeURIComponent(split)}&offset=${offset}&length=${length}`;
@@ -93,17 +112,29 @@ export async function fetchRows(
   });
 }
 
+export async function loadDataset(
+  dataset: string,
+  token?: string,
+  start = 0,
+  length = 100,
+): Promise<{ info: DatasetInfo; rows: HfRow[] }> {
+  const info = await fetchDatasetInfo(dataset, token);
+  const rows = await fetchRows(dataset, info, start, length, token);
+  return { info, rows };
+}
+
 export async function fetchImageBlob(url: string, token?: string): Promise<Blob> {
   // Pre-signed HF CDN URLs (cached-assets) already carry auth in the query string.
   // Adding an Authorization header triggers a CORS preflight the CDN rejects,
-  // causing a "Failed to fetch". Only attach the bearer for raw huggingface.co API URLs.
+  // causing a "Failed to fetch". Only attach the bearer for raw HF asset URLs.
   const isPresigned =
     /[?&](Signature|X-Amz-Signature|sig)=/.test(url) ||
     url.includes("cached-assets") ||
     url.includes("cdn-lfs");
   const headers: Record<string, string> = {};
-  if (token && url.includes("huggingface.co") && !isPresigned) {
+  if (token && (url.includes("huggingface.co") || url.includes("hf.co")) && !isPresigned) {
     headers.Authorization = `Bearer ${token}`;
+    headers["X-HF-Token"] = token;
   }
   const res = await fetch(url, { headers });
   if (!res.ok) throw new Error(`Image fetch failed: ${res.status}`);

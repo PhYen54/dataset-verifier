@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronLeft,
   ChevronRight,
@@ -26,14 +26,137 @@ import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import {
-  fetchDatasetInfo,
   fetchRows,
+  loadDataset,
   fetchImageBlob,
   pushDataset,
   type DatasetInfo,
   type HfRow,
 } from "@/lib/hf";
 import { transformImage, inferExtension } from "@/lib/image-transform";
+
+const TEXT_NODE = 3;
+const ELEMENT_NODE = 1;
+
+function domNodeToReact(node: ChildNode, key?: string | number): ReactNode {
+  if (node.nodeType === TEXT_NODE) {
+    return node.textContent;
+  }
+
+  if (node.nodeType !== ELEMENT_NODE) {
+    return null;
+  }
+
+  const element = node as HTMLElement;
+  const children = Array.from(element.childNodes).map((child, index) => domNodeToReact(child, index));
+  const tag = element.tagName.toLowerCase();
+
+  switch (tag) {
+    case "br":
+      return <br key={key} />;
+    case "p":
+      return (
+        <p key={key} className="mb-2 leading-6">
+          {children}
+        </p>
+      );
+    case "div":
+      return (
+        <div key={key} className="mb-2">
+          {children}
+        </div>
+      );
+    case "span":
+      return <span key={key}>{children}</span>;
+    case "strong":
+    case "b":
+      return <strong key={key}>{children}</strong>;
+    case "em":
+    case "i":
+      return <em key={key}>{children}</em>;
+    case "u":
+      return <u key={key}>{children}</u>;
+    case "code":
+      return (
+        <code key={key} className="rounded bg-muted px-1 py-0.5 font-mono text-xs">
+          {children}
+        </code>
+      );
+    case "pre":
+      return (
+        <pre key={key} className="overflow-x-auto rounded bg-muted p-3 text-xs">
+          {children}
+        </pre>
+      );
+    case "ul":
+      return (
+        <ul key={key} className="list-disc pl-5 space-y-1">
+          {children}
+        </ul>
+      );
+    case "ol":
+      return (
+        <ol key={key} className="list-decimal pl-5 space-y-1">
+          {children}
+        </ol>
+      );
+    case "li":
+      return <li key={key}>{children}</li>;
+    case "a":
+      return (
+        <a
+          key={key}
+          href={element.getAttribute("href") ?? "#"}
+          target="_blank"
+          rel="noreferrer"
+          className="text-primary underline"
+        >
+          {children}
+        </a>
+      );
+    case "th":
+      return (
+        <th key={key} className="border px-2 py-1 text-left text-xs uppercase tracking-wide text-muted-foreground bg-muted">
+          {children}
+        </th>
+      );
+    case "td":
+      return (
+        <td key={key} className="border px-2 py-1 align-top text-sm">
+          {children}
+        </td>
+      );
+    case "tr":
+      return (
+        <tr key={key} className="border-t last:border-b">
+          {children}
+        </tr>
+      );
+    case "thead":
+      return <thead key={key}>{children}</thead>;
+    case "tbody":
+      return <tbody key={key}>{children}</tbody>;
+    case "table":
+      return (
+        <div key={key} className="overflow-x-auto rounded-lg border border-border">
+          <table className="min-w-full border-collapse text-sm">{children}</table>
+        </div>
+      );
+    default:
+      return <span key={key}>{children}</span>;
+  }
+}
+
+function parseHtmlLabel(html: string) {
+  if (!html) return "";
+  if (typeof window !== "undefined" && "DOMParser" in window) {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, "text/html");
+    const nodes = Array.from(doc.body.childNodes).map((node, index) => domNodeToReact(node, index));
+    return <>{nodes}</>;
+  }
+  return html;
+}
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -144,6 +267,36 @@ function OcrVerifier() {
     [datasetId, readToken, ingest, baseOffset],
   );
 
+  const refreshImageUrl = useCallback(
+    async (rowIndex: number): Promise<string> => {
+      if (!info) throw new Error("Dataset info is missing");
+      const rows = await fetchRows(datasetId.trim(), info, rowIndex, 1, readToken || undefined);
+      if (!rows.length) throw new Error(`Failed to refresh row ${rowIndex}`);
+      const freshUrl = rows[0].imageUrl;
+      setItems((prev) =>
+        prev.map((item) =>
+          item.index === rowIndex ? { ...item, imageUrl: freshUrl } : item,
+        ),
+      );
+      return freshUrl;
+    },
+    [datasetId, info, readToken],
+  );
+
+  const loadImageBlob = useCallback(
+    async (item: ItemState) => {
+      try {
+        return await fetchImageBlob(item.imageUrl, readToken || undefined);
+      } catch (err) {
+        console.warn(`Image fetch failed for row ${item.index}, refreshing URL`, err);
+        if (!info) throw err;
+        const freshUrl = await refreshImageUrl(item.index);
+        return await fetchImageBlob(freshUrl, readToken || undefined);
+      }
+    },
+    [info, readToken, refreshImageUrl],
+  );
+
   const handleDownload = useCallback(async () => {
     if (!info) {
       toast.error("Load a dataset first");
@@ -162,13 +315,7 @@ function OcrVerifier() {
       const transformed: { filename: string; blob: Blob; label: string }[] = [];
       for (let i = 0; i < kept.length; i++) {
         const it = kept[i];
-        let orig: Blob;
-        try {
-          orig = await fetchImageBlob(it.imageUrl, readToken || undefined);
-        } catch (e) {
-          console.warn(`Image fetch failed for row ${it.index}, retrying without auth`, e);
-          orig = await fetchImageBlob(it.imageUrl);
-        }
+        const orig = await loadImageBlob(it);
         const needTx = it.rotation !== 0 || it.flipH || it.flipV;
         const blob = needTx
           ? await transformImage(orig, it.rotation, it.flipH, it.flipV, orig.type || "image/png")
@@ -214,7 +361,7 @@ function OcrVerifier() {
     } finally {
       setDownloading(false);
     }
-  }, [datasetId, info, items, readToken]);
+  }, [datasetId, info, items, readToken, loadImageBlob]);
 
     useEffect(() => {
       if (!visibleTotal) return;
@@ -235,16 +382,21 @@ function OcrVerifier() {
     setLoadedCount(0);
     setCurrent(0);
     try {
-      const dsInfo = await fetchDatasetInfo(datasetId.trim(), readToken || undefined);
-      setInfo(dsInfo);
       const rawStart = Number(startIndex) || 0;
-      const start = Math.max(0, Math.min(rawStart, Math.max(0, dsInfo.numRows - 1)));
-      setBaseOffset(start);
-      const firstLen = Math.min(INITIAL_BATCH, Math.max(0, dsInfo.numRows - start));
-      const firstRows = await fetchRows(datasetId.trim(), dsInfo, start, firstLen, readToken || undefined);
+      const token = readToken || undefined;
+      const start = Math.max(0, rawStart);
+      const { info: dsInfo, rows: firstRows } = await loadDataset(
+        datasetId.trim(),
+        token,
+        start,
+        INITIAL_BATCH,
+      );
+      setInfo(dsInfo);
+      const clampedStart = Math.min(start, Math.max(0, dsInfo.numRows - 1));
+      setBaseOffset(clampedStart);
       ingest(firstRows);
-      console.info(`[load] initial batch loaded ${firstRows.length} / ${dsInfo.numRows} (start=${start})`);
-      toast.success(`Loaded ${firstRows.length} rows starting at ${start} of ${dsInfo.numRows} total rows`);
+      console.info(`[load] initial batch loaded ${firstRows.length} / ${dsInfo.numRows} (start=${clampedStart})`);
+      toast.success(`Loaded ${firstRows.length} rows starting at ${clampedStart} of ${dsInfo.numRows} total rows`);
       setLoading(false);
     } catch (err) {
       setLoading(false);
@@ -328,14 +480,7 @@ function OcrVerifier() {
       // Transform images sequentially to keep memory bounded (one bitmap at a time).
       for (let i = 0; i < kept.length; i++) {
         const it = kept[i];
-        let orig: Blob;
-        try {
-          orig = await fetchImageBlob(it.imageUrl, readToken || undefined);
-        } catch (e) {
-          // Retry once without auth header in case of CORS issues on signed URLs
-          console.warn(`Image fetch failed for row ${it.index}, retrying without auth`, e);
-          orig = await fetchImageBlob(it.imageUrl);
-        }
+        const orig = await loadImageBlob(it);
         const needTx = it.rotation !== 0 || it.flipH || it.flipV;
         const blob = needTx
           ? await transformImage(orig, it.rotation, it.flipH, it.flipV, orig.type || "image/png")
@@ -365,7 +510,7 @@ function OcrVerifier() {
         void loadNextBatch(info, loadedCount, datasetId.trim());
       }
     }
-  }, [items, writeToken, targetRepo, readToken, loadingMore, info, loadedCount, loadNextBatch, datasetId]);
+  }, [items, writeToken, targetRepo, readToken, loadingMore, info, loadedCount, loadNextBatch, loadImageBlob, datasetId]);
 
   // ---------- Derived ----------
   const stats = useMemo(() => {
@@ -537,6 +682,7 @@ function OcrVerifier() {
                     className="max-h-[70vh] max-w-full object-contain transition-transform duration-300 ease-out shadow-lg rounded-md bg-white"
                     style={{ transform: imgTransform }}
                     draggable={false}
+                    onError={() => void refreshImageUrl(item.index)}
                   />
                 )}
                 {item?.deleted && (
@@ -582,24 +728,40 @@ function OcrVerifier() {
                 </div>
               </Card>
 
-              {/* Label editor */}
-              <Card className="p-4 flex-1 flex flex-col">
-                <div className="flex items-center justify-between mb-2">
-                  <Label htmlFor="lbl" className="text-xs uppercase tracking-wide text-muted-foreground">
-                    Label
-                  </Label>
-                  <span className="text-[10px] text-muted-foreground">
-                    Enter = save & next · Shift+Enter = newline
-                  </span>
-                </div>
-                <Textarea
-                  id="lbl"
-                  value={item?.label ?? ""}
-                  onChange={(e) => update(current, { label: e.target.value })}
-                  className="flex-1 min-h-[160px] font-mono text-sm resize-none"
-                  placeholder="OCR transcription..."
-                />
-              </Card>
+              {/* Label editor + preview */}
+              <div className="grid gap-4 md:grid-cols-2">
+                <Card className="p-4 flex flex-col">
+                  <div className="flex items-center justify-between mb-2">
+                    <Label htmlFor="lbl" className="text-xs uppercase tracking-wide text-muted-foreground">
+                      Raw label
+                    </Label>
+                    <span className="text-[10px] text-muted-foreground">
+                      Enter = save & next · Shift+Enter = newline
+                    </span>
+                  </div>
+                  <Textarea
+                    id="lbl"
+                    value={item?.label ?? ""}
+                    onChange={(e) => update(current, { label: e.target.value })}
+                    className="flex-1 min-h-[160px] font-mono text-sm resize-none"
+                    placeholder="OCR transcription..."
+                  />
+                </Card>
+
+                <Card className="p-4 flex flex-col">
+                  <div className="flex items-center justify-between mb-2">
+                    <Label className="text-xs uppercase tracking-wide text-muted-foreground">
+                      Parsed label
+                    </Label>
+                    <span className="text-[10px] text-muted-foreground">
+                      HTML stripped for review
+                    </span>
+                  </div>
+                  <div className="flex-1 min-h-[160px] rounded-md border border-border bg-secondary/50 p-3 overflow-auto text-sm whitespace-pre-wrap break-words">
+                    {item ? parseHtmlLabel(item.label) || <span className="text-muted-foreground">Empty label</span> : <span className="text-muted-foreground">No row selected</span>}
+                  </div>
+                </Card>
+              </div>
 
               {/* Navigation */}
               <Card className="p-4 space-y-3">
@@ -731,10 +893,8 @@ function EmptyState() {
       </div>
       <h2 className="text-xl font-semibold">Load a Hugging Face dataset to begin</h2>
         <p className="text-sm text-muted-foreground mt-2 max-w-md">
-        Enter a dataset ID with <code className="font-mono">image</code> and a string
-        label column. The first 100 rows load instantly, then additional rows
-        load in batches of 100 on demand. You can also specify a start and end
-        index to load a specific range of rows.
+        Enter a dataset ID with columns <code className="font-mono">file_name</code>, <code className="font-mono">image</code>, and <code className="font-mono">label</code>. The first 100 rows load instantly, then additional rows
+        load in batches of 100 on demand. You can also specify a start index to load a specific range of rows.
       </p>
     </div>
   );
