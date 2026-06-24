@@ -142,6 +142,25 @@ function domNodeToReact(node: ChildNode, key?: string | number): ReactNode {
           <table className="min-w-full border-collapse text-sm">{children}</table>
         </div>
       );
+    case "hr":
+      return <hr key={key} className="my-4 border-border" />;
+    case "del":
+      return (
+        <del key={key} className="line-through text-muted-foreground">
+          {children}
+        </del>
+      );
+    case "h1":
+    case "h2":
+    case "h3":
+    case "h4":
+    case "h5":
+    case "h6":
+      return (
+        <div key={key} className="font-semibold mt-4 mb-2 text-base">
+          {children}
+        </div>
+      );
     default:
       return <span key={key}>{children}</span>;
   }
